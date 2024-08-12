@@ -42,7 +42,7 @@ type
 
   HyalosInfo = object
     hyUnion1: UnionLongLong
-    batchLink: ptr HyalosInfo # Atomic
+    batchLink: Atomic[ptr HyalosInfo]
     hyUnion2: UnionLongLong
 
   HyalosBatch = object # Align 16
@@ -65,8 +65,8 @@ type
     epochFreq: int
     freq: int
     collect: bool
-    slots: ptr array[N, HyalosSlot]
-    batches: ptr array[N, HyalosBatch]
+    slots {.align: 16.}: ptr array[N, HyalosSlot]
+    batches {.align: 16.}: ptr array[N, HyalosBatch]
     allocCounters: ptr array[N, Padded[uint64]]
     epoch: Atomic[uint64]
     slowCounter: Atomic[uint64]
@@ -99,24 +99,21 @@ func `=destroy`[T, N](self: var HyalosTracker[T, N]) =
   deallocAligned(self.slots, 16)
   deallocShared(self.allocCounters)
 
-proc allocHyalosBatch(taskNum: int): ptr HyalosBatch =
-  let resultPtr = allocAligned0(sizeof(HyalosBatch) * taskNum, 16)
-  return cast[ptr HyalosBatch](resultPtr)
-proc allocHyalosSlot(taskNum: int): ptr HyalosSlot =
-  let resultPtr = allocAligned0(sizeof(HyalosSlot) * taskNum, 16)
-  return cast[ptr HyalosSlot](resultPtr)
-proc allocHyalosCounters(taskNum: int): pointer =
-  result = allocShared0(sizeof(Padded[uint64]) * taskNum)
 
 
 func newHyalosTracker*[T, N](taskNum = N; hrNum, epochFreq, freq: int = 0; collect: bool = false): HyalosTracker =
   result = new HyalosTracker[T, N]
-  result.taskNum = N
+  result.taskNum = N # Can be removed, static
   result.hrNum = hrNum
   result.epochFreq = epochFreq
   result.freq = freq
   result.collect = collect
+  # Manual alloc batches and slots aligned to 16 as per paper
+  let batches = allocAligned0(sizeof(result.batches), 16)
+  let slots = allocAligned0(sizeof(result.batches), 16)
+  # Manual alloc counters padded to cacheLineSize as per paper
+  let allocCounters = allocShared0(sizeof(result.allocCounters))
 
-  result.batches = allocHyalosBatch(N)
-  result.slots = allocHyalosSlot(N)
-  result.allocCounters = allocHyalosCounters(N)
+  result.batches = cast[ptr HyalosBatch](batches)
+  result.slots = cast[ptr HyalosSlot](slots)
+  result.allocCounters = allocCounters
