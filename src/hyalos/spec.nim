@@ -21,6 +21,13 @@ type
   UnionDoubleWidth = distinct array[2, uint64]
   UnionLongLong = distinct uint64
 
+proc load(at: ptr UnionWordPair | var UnionWordPair; mo = ATOMIC_SEQ_CST): UnionValuePair =
+  when at is not ptr UnionWordPair:
+    let loadPtr = cast[ptr int128](addr at.data)
+  else:
+    let loadPtr = cast[ptr int128](addr at[].data)
+  cast[UnionValuePair](atomicLoad(loadPtr, mo))
+
 template padding(T: typedesc): int =
   ## Convenience internal template
   ## used in array padding
@@ -124,11 +131,11 @@ proc `=destroy`[T; N: static int](self: var HyalosTrackerObj[T, N]) =
 
 
 
-proc newHyalosTracker*[T; N: static int](hrNum, epochFreq, freq: int; collect: bool = false): HyalosTracker[T, N] =
+proc newHyalosTracker*[T; N: static int](hrNum, epochFreq, emptyFreq: int; collect: bool = false): HyalosTracker[T, N] =
   result = new HyalosTracker[T, N]
   result.hrNum = hrNum
   result.epochFreq = epochFreq
-  result.freq = freq
+  result.freq = emptyFreq
   result.collect = collect
   # Manual alloc batches and slots aligned to 16 as per paper
   var batches = allocAligned0(sizeof(result.batches), 16)
@@ -145,5 +152,48 @@ proc newHyalosTracker*[T; N: static int](hrNum, epochFreq, freq: int; collect: b
   result.slowCounter.store(0, ATOMIC_RELEASE)
   result.epoch.store(1, ATOMIC_RELEASE)
 
+proc newHyalosTracker*[T; N: static int](emptyFreq: int): HyalosTracker[T, N] =
+  return newHyalosTracker[T, N](0, emptyFreq = emptyFreq, true)
+
+proc getEpoch*[T, N](tracker: HyalosTracker[T,N]): uint64 =
+  return tracker.epoch.load(ATOMIC_ACQUIRE)
+
+proc doUpdate[T, N](tracker: HyalosTracker[T, N]; currEpoch: var uint64; index, tid: int): uint64 =
+  template truthy: untyped =
+    not isNil load(tracker.slots[tid].first[index].list[0], ATOMIC_ACQUIRE)
+  if truthy:
+    let first = load(tracker.slots[tid].first[index].list[0].exchange(invPtr[uint64](), ATOMIC_ACQ_REL))
+    if first != invPtr[uint64]():
+      ## Traverse cache
+    tracker.slots[tid].first[index].list[0].store(0'u, ATOMIC_SEQ_CST)
+    currEpoch = tracker.getEpoch()
+  tracker.slots[tid].epoch[index].pair[0].store(currEpoch, ATOMIC_SEQ_CST)
+  return currEpoch
+
+proc helpThread*[T, N](tracker: HyalosTracker[T,N]; tid, index, mytid: int) {.inline.} =
+  var last_result: UnionValuePair
+  last_result = load(tracker.slots[tid].state[index].hyResult, ATOMIC_ACQUIRE)
+  if last_result.pair[0] != invPtr[uint64]():
+    return
+  let birthEpoch = load(tracker.slots[tid].state[index].hyEpoch, ATOMIC_ACQUIRE)
+  let parent = load(tracker.slots[tid].state[index].hyParent, ATOMIC_ACQUIRE)
+  if not isNil parent:
+    tracker.slots[mytid].first[tracker.hrNum].list[0].store(0'u, ATOMIC_SEQ_CST)
+    tracker.slots[mytid].epoch[tracker.hrNum].pair[0].store(birthEpoch, ATOMIC_SEQ_CST)
+  tracker.slots[mytid].state[tracker.hrNum].hyParent.store(parent, ATOMIC_SEQ_CST)
+  let obj: ptr HyAtomic[ptr T] = cast[ptr HyAtomic[ptr T]](
+    tracker.slots[tid].state[index].hyPointer.load(ATOMIC_ACQUIRE)
+  )
+  var seqno: uint64 = tracker.slots[tid].epoch[index].pair[1].load(ATOMIC_ACQUIRE)
+  if last_result.pair[1] == seqno:
+    var prevEpoch = tracker.getEpoch()
+
+  template truthy: untyped =
+    last_result.full == load(tracker.slots[tid].state[index].hyResult.full, ATOMIC_ACQUIRE)
+
+  # while truthy:
+  #   prevEpoch = doUpdate
+
 when isMainModule:
   let trakr = newHyalosTracker[uint, 14](12,0,0)
+  helpThread(trakr, 1, 1, 2)

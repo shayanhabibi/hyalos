@@ -4,7 +4,7 @@ type
   HyAtomic*[T] = distinct uint64
 
 proc addFetch*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: ptr | pointer | uint64 | int64 | int | uint; mo = ATOMIC_SEQ_CST): T {.inline.} =
-  when typeof p != ptr:
+  when p is not ptr HyAtomic[T]:
     let pptr = addr p
   else:
     let pptr = p
@@ -18,7 +18,7 @@ proc store*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: ptr | pointer | uint64 |
     let pptr = p
   atomicStoreN(cast[ptr uint64](pptr), cast[uint64](v), mo)
 proc load*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; mo = ATOMIC_SEQ_CST): T {.inline.} =
-  when typeof p != ptr:
+  when p is not ptr HyAtomic[T]:
     let pptr = addr p
   else:
     let pptr = p
@@ -26,7 +26,7 @@ proc load*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; mo = ATOMIC_SEQ_CST): T {.in
     atomicLoadN(cast[ptr uint64](pptr), mo)
   )
 proc exchange*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; v: ptr | pointer | uint64 | int64 | int | uint; mo = ATOMIC_SEQ_CST): T {.inline.} =
-  when typeof p != ptr:
+  when p is not ptr HyAtomic[T]:
     let pptr = addr p
   else:
     let pptr = p
@@ -98,6 +98,10 @@ elif defined(gcc) or defined(amd64):
     ## when compiling with `clang`
     return cast[hint128](
       atomicSubFetchImpl(cast[ptr int128](p), cast[int128](val))
+    )
+  proc atomicLoad*(p: ptr int128 | ptr hint128; mo = ATOMIC_SEQ_CST): hint128 = # Sad
+    return cast[hint128](
+      atomicAddFetchImpl(cast[ptr int128](p), cast[int128](hint128(hi:0'u,lo:0'u)))
     )
 
   proc atomicAddFetch*(self: var hint128, value: hint128, memoryOrder = ATOMIC_SEQ_CST): hint128 =
