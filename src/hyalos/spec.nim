@@ -59,8 +59,7 @@ type
     state: array[MAX_WFR, HyalosState]
     _: array[cacheLineSize, char]
 
-  HyalosTracker*[T; N: int] = object
-    taskNum: int
+  HyalosTracker*[T; N: static int] = object
     hrNum: int
     epochFreq: int
     freq: int
@@ -70,7 +69,6 @@ type
     allocCounters: ptr array[N, Padded[uint64]]
     epoch: Atomic[uint64]
     slowCounter: Atomic[uint64]
-
 
 ##  To make conversion of the algorithm easier, distinct arrays
 ##  are used to represent unions with convenience templates
@@ -83,7 +81,7 @@ template list*[I](val: UnionValuePair): ptr HyalosInfo = cast[array[2, ptr Hyalo
 # Union Handling
 template full*(val: UnionWordPair): hint128 = cast[hint128](val.data)
 template pair*[I](val: UnionWordPair): Atomic[uint64] = cast[array[2, Atomic[uint64]]](val.data)[I]
-template list*[I](val: UnionWordPair): Atomic[ptr HyalosInfo] = cast[array[2, Atomic[ptr HyalosInfo]]](val.data[I])
+template list*(val: UnionWordPair): array[2, Atomic[ptr HyalosInfo]] = cast[array[2, Atomic[ptr HyalosInfo]]](val.data)
 # Union Handling - HyalosInfo Union 1
 template next*(val: HyalosInfo):  ptr HyalosInfo = cast[ptr HyalosInfo](val.hyUnion1)
 template slot*(val: HyalosInfo): ptr UnionWordPair = cast[ptr UnionWordPair](val.hyUnion1)
@@ -94,16 +92,15 @@ template batchNext*(val: HyalosInfo): ptr HyalosInfo = cast[ptr HyalosInfo](val.
 
 
 
-func `=destroy`[T, N](self: var HyalosTracker[T, N]) =
+proc `=destroy`[T; N: static int](self: var HyalosTracker[T, N]) =
   deallocAligned(self.batches, 16)
   deallocAligned(self.slots, 16)
   deallocShared(self.allocCounters)
 
 
 
-func newHyalosTracker*[T, N](taskNum = N; hrNum, epochFreq, freq: int = 0; collect: bool = false): HyalosTracker =
-  result = new HyalosTracker[T, N]
-  result.taskNum = N # Can be removed, static
+proc newHyalosTracker*[T; N: static int](hrNum, epochFreq, freq: int; collect: bool = false): HyalosTracker[T, N] =
+  result = HyalosTracker[T, N]()
   result.hrNum = hrNum
   result.epochFreq = epochFreq
   result.freq = freq
@@ -114,6 +111,10 @@ func newHyalosTracker*[T, N](taskNum = N; hrNum, epochFreq, freq: int = 0; colle
   # Manual alloc counters padded to cacheLineSize as per paper
   let allocCounters = allocShared0(sizeof(result.allocCounters))
 
-  result.batches = cast[ptr HyalosBatch](batches)
-  result.slots = cast[ptr HyalosSlot](slots)
-  result.allocCounters = allocCounters
+  result.batches = cast[ptr array[N, HyalosBatch]](batches)
+  result.slots = cast[ptr array[N, HyalosSlot]](slots)
+  result.allocCounters = cast[typeof result.allocCounters](allocCounters)
+
+  for i in 0..N-1:
+    for j in 0..hrNum+1:
+      discard
