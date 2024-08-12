@@ -1,3 +1,41 @@
+## Defines helpers for atomic ops and DCAS ops
+
+type
+  HyAtomic*[T] = distinct uint64
+
+proc addFetch*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: ptr | pointer | uint64 | int64 | int | uint; mo = ATOMIC_SEQ_CST): T {.inline.} =
+  when typeof p != ptr:
+    let pptr = addr p
+  else:
+    let pptr = p
+  cast[T](
+      atomicAddFetch(cast[ptr uint64](pptr), cast[uint64](v), mo)
+    )
+proc store*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: ptr | pointer | uint64 | int64 | int | uint; mo = ATOMIC_SEQ_CST) {.inline.} =
+  when p is not ptr HyAtomic[T]:
+    let pptr = addr p
+  else:
+    let pptr = p
+  atomicStoreN(cast[ptr uint64](pptr), cast[uint64](v), mo)
+proc load*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; mo = ATOMIC_SEQ_CST): T {.inline.} =
+  when typeof p != ptr:
+    let pptr = addr p
+  else:
+    let pptr = p
+  cast[T](
+    atomicLoadN(cast[ptr uint64](pptr), mo)
+  )
+proc exchange*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; v: ptr | pointer | uint64 | int64 | int | uint; mo = ATOMIC_SEQ_CST): T {.inline.} =
+  when typeof p != ptr:
+    let pptr = addr p
+  else:
+    let pptr = p
+  cast[T](
+    atomicExchangeN(cast[ptr uint64](pptr), cast[uint64](v), mo)
+  )
+
+
+
 # Define the int128 base type and the helper type hint128 to
 # use double word atomic operations on available architectures
 
