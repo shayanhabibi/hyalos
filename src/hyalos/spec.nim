@@ -1,22 +1,24 @@
-import std/atomics
 import hyalos/atomics2
+import std/atomics
 import hyalos/memalloc
 
 const
-  hyalosBatchSize* {.intdefine.} = 8
-  cacheLineSize* {.intdefine.} = 128
+  cacheLineSize* {.intdefine.} = 128 ## Size of local cache line; TODO automate
   MAX_WFR = 16
   MAX_WFRC = 12
   WFR_PROTECT1 = 1'u64 shl 63
   WFR_PROTECT2 = 1'u64 shl 62
-
+  WFR_INVPTR = cast[pointer](high(uint64))
 template isInvalid*[T](this: pointer | ptr T): bool =
+  ## Convenience internal template
   cast[pointer](this) == cast[pointer](high(uint64))
 
 template WFR_RNODE*(n: typed): untyped =
   discard
 
 template padding(T: typedesc): int =
+  ## Convenience internal template
+  ## used in array padding
   if sizeof(T) mod cacheLineSize != 0:
     cacheLineSize - (sizeof(T) mod cacheLineSize)
   else:
@@ -37,7 +39,7 @@ type
     hyResult: UnionWordPair
     hyEpoch: Atomic[uint64]
     hyPointer: Atomic[uint64]
-    hyParent: Atomic[uint64]
+    hyParent: Atomic[ptr HyalosInfo]
     _: pointer
 
   HyalosInfo = object
@@ -59,7 +61,7 @@ type
     state: array[MAX_WFR, HyalosState]
     _: array[cacheLineSize, char]
 
-  HyalosTracker*[T; N: static int] = object
+  HyalosTrackerObj*[T; N: static int] = object
     hrNum: int
     epochFreq: int
     freq: int
@@ -67,20 +69,26 @@ type
     slots {.align: 16.}: ptr array[N, HyalosSlot]
     batches {.align: 16.}: ptr array[N, HyalosBatch]
     allocCounters: ptr array[N, Padded[uint64]]
-    epoch: Atomic[uint64]
-    slowCounter: Atomic[uint64]
+    epoch: Padded[Atomic[uint64]]
+    slowCounter: Padded[Atomic[uint64]]
+  HyalosTracker*[T; N: static int] = ref HyalosTrackerObj[T, N] # Has to be ordered after Obj or invalid nimskull issue 1413
 
 ##  To make conversion of the algorithm easier, distinct arrays
 ##  are used to represent unions with convenience templates
 ##  converting them to their respective types
 
+func slowCounter*[T, N](self: HyalosTracker[T, N]): Atomic[uint64] {.inline.} =
+  self.slowCounter.data
+func epoch*[T, N](self: HyalosTracker[T, N]): Atomic[uint64] {.inline.} =
+  self.epoch.data
+
 # Union Handling
 template full*(val: UnionValuePair): hint128 = cast[hint128](val)
-template pair*[I](val: UnionValuePair): uint64 = cast[array[2, uint64]](val)[I]
-template list*[I](val: UnionValuePair): ptr HyalosInfo = cast[array[2, ptr HyalosInfo]](val)[I]
+template pair*(val: UnionValuePair): array[2, uint64] = cast[array[2, uint64]](val)
+template list*(val: UnionValuePair): array[2, ptr HyalosInfo] = cast[array[2, ptr HyalosInfo]](val)
 # Union Handling
 template full*(val: UnionWordPair): hint128 = cast[hint128](val.data)
-template pair*[I](val: UnionWordPair): Atomic[uint64] = cast[array[2, Atomic[uint64]]](val.data)[I]
+template pair*(val: UnionWordPair): array[2, Atomic[uint64]] = cast[array[2, Atomic[uint64]]](val.data)
 template list*(val: UnionWordPair): array[2, Atomic[ptr HyalosInfo]] = cast[array[2, Atomic[ptr HyalosInfo]]](val.data)
 # Union Handling - HyalosInfo Union 1
 template next*(val: HyalosInfo):  ptr HyalosInfo = cast[ptr HyalosInfo](val.hyUnion1)
@@ -92,7 +100,7 @@ template batchNext*(val: HyalosInfo): ptr HyalosInfo = cast[ptr HyalosInfo](val.
 
 
 
-proc `=destroy`[T; N: static int](self: var HyalosTracker[T, N]) =
+proc `=destroy`[T; N: static int](self: var HyalosTrackerObj[T, N]) =
   deallocAligned(self.batches, 16)
   deallocAligned(self.slots, 16)
   deallocShared(self.allocCounters)
@@ -100,21 +108,28 @@ proc `=destroy`[T; N: static int](self: var HyalosTracker[T, N]) =
 
 
 proc newHyalosTracker*[T; N: static int](hrNum, epochFreq, freq: int; collect: bool = false): HyalosTracker[T, N] =
-  result = HyalosTracker[T, N]()
+  result = new HyalosTracker[T, N]
   result.hrNum = hrNum
   result.epochFreq = epochFreq
   result.freq = freq
   result.collect = collect
   # Manual alloc batches and slots aligned to 16 as per paper
-  let batches = allocAligned0(sizeof(result.batches), 16)
-  let slots = allocAligned0(sizeof(result.batches), 16)
+  var batches = allocAligned0(sizeof(result.batches), 16)
+  var slots = allocAligned0(sizeof(result.batches), 16)
   # Manual alloc counters padded to cacheLineSize as per paper
-  let allocCounters = allocShared0(sizeof(result.allocCounters))
+  var allocCounters = allocShared0(sizeof(result.allocCounters))
 
   result.batches = cast[ptr array[N, HyalosBatch]](batches)
   result.slots = cast[ptr array[N, HyalosSlot]](slots)
   result.allocCounters = cast[typeof result.allocCounters](allocCounters)
-
   for i in 0..N-1:
     for j in 0..hrNum+1:
-      discard
+      # proc giveMeMyFuckingMutability[T, N](self: HyalosTracker[T, N]): var Atomic[ptr HyalosInfo] =
+      #   return self.slots[i].first[j].list[0]
+      # giveMeMyFuckingMutability(result).store(WFR_INVPTR, moRelease)
+      result.slots[i].first[j].list[0].store(WFR_INVPTR, moRelease)
+  result.slowCounter.store(0, moRelease)
+  result.epoch.store(1, moRelease)
+
+when isMainModule:
+  let trakr = newHyalosTracker[uint, 16](16,0,0)
