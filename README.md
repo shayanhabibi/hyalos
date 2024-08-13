@@ -17,7 +17,7 @@ The algorithm has almost been transcribed, working around numerous
 obstacles such as lack of DCAS operations on AMD64 w/ GCC toolchain.
 
 - [x] *Algorithm transcribed* - The algorithm has been transcribed but the atomics (among other things) have to be completely refactored to avoid any use of system lib
-
+- [ ] Refactor [Nuclear](https://github.com/shayanhabibi/nuclear) as a replacement for Atomics
   - [ ] __sync legacy funcs for DCAS ops on GCC
   - [ ] Test DCAS ops
 
