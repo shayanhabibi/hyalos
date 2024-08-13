@@ -7,10 +7,9 @@
 
 type
   # Import int128 type from C
-  int128 {.importc: "__int128".} = object
+  int128 {.importc: "__int128".} = distinct array[2, int64]
     # Any access of the fields will generate invalid
     # C code (the __int128 type has no fields)
-    _, DONOTACCESS: uint64
 
   # Define a helper object to act as a go-between
   hint128* = object
@@ -25,6 +24,19 @@ type
     elif sizeof(T) == 16:
       val: int128
 
+  MemOrder = distinct cint
+
+  HyAtomTypes* = int128|int|uint|int64|uint64|pointer|ptr
+
+
+var
+  Relaxed {.importc: "__ATOMIC_RELAXED", nodecl, used.}: MemOrder
+  Consume {.importc: "__ATOMIC_CONSUME", nodecl, used.}: MemOrder
+  Acquire {.importc: "__ATOMIC_ACQUIRE", nodecl, used.}: MemOrder
+  Release {.importc: "__ATOMIC_RELEASE", nodecl, used.}: MemOrder
+  AcqRel {.importc: "__ATOMIC_ACQ_REL", nodecl, used.}: MemOrder
+  SeqCst {.importc: "__ATOMIC_SEQ_CST", nodecl, used.}: MemOrder
+
 converter toInt128*(hint: hint128): int128 =
   # hint128 and int128 are the same, there shall
   # be no fear in casting to int128
@@ -35,31 +47,32 @@ converter toPtrInt128*(at: ptr hint128): ptr int128 =
 when defined(clang) and (defined(amd64) or defined(x86)):
   # GCC no longer emits cmpxchg16 for double word atomics
   # When using clang however, will call built in __atomic funcs
-  proc atomicAddFetch(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST): int128 {.importc: "__atomic_add_fetch", nodecl.}
-  proc atomicSubFetch(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST): int128 {.importc: "__atomic_sub_fetch", nodecl.}
-  proc atomicLoadN(p: ptr int128, mo = ATOMIC_SEQ_CST): int128 {.importc: "__atomic_load_n", nodecl.}
-  proc atomicCompareExchangeN(p, expected: ptr int128, val: int128,
-  weak: bool = false, mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_RELEASE): bool {.importc: "__atomic_compare_exchange_n", nodecl.}
-  proc atomicStoreN(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST) {.importc: "__atomic_store_n", nodecl.}
+  proc addFetchImpl[T: HyAtomTypes](p: ptr T, val: T, mo = SeqCst): T {.importc: "__atomic_add_fetch", nodecl.}
+  proc subFetchImpl[T: HyAtomTypes](p: ptr T, val: T, mo = SeqCst): T {.importc: "__atomic_sub_fetch", nodecl.}
+  proc loadNImpl[T: HyAtomTypes](p: ptr T, mo = SeqCst): T {.importc: "__atomic_load_n", nodecl.}
+  proc compareExchangeNImpl[T: HyAtomTypes](p, expected: ptr T, val: T,
+    weak: bool = false, mo_succ = SeqCst, mo_fail = Release
+    ): bool {.importc: "__atomic_compare_exchange_n", nodecl.}
+  proc storeNImpl(p: ptr int128, val: int128, mo = SeqCst) {.importc: "__atomic_store_n", nodecl.}
 elif defined(gcc) or defined(amd64):
   # GCC no longer emits cmpxchg16 for double word atomics
   # When using GCC, will use deprecated __sync funcs which still emit CMPXCHG16 instructions
   # Note that __sync calls are full synchronisations (more cost)
-  proc atomicAddFetchImpl(p: ptr int128, val: int128): int128 {.importc: "__sync_add_and_fetch", nodecl.}
-  proc atomicSubFetchImpl(p: ptr int128, val: int128): int128 {.importc: "__sync_sub_and_fetch", nodecl.}
-  proc atomicCompareExchangeImpl(p: ptr int128, expected: int128, val: int128): bool {.importc: "__sync_bool_compare_and_swap", nodecl.}
-  proc atomicCompareExchangeValImpl(p: ptr int128, expected: int128, val: int128): int128 {.importc: "__sync_val_compare_and_swap", nodecl.}
+  proc addFetchImpl(p: ptr int128, val: int128): int128 {.importc: "__sync_add_and_fetch", nodecl.}
+  proc subFetchImpl(p: ptr int128, val: int128): int128 {.importc: "__sync_sub_and_fetch", nodecl.}
+  proc compareExchangeImpl(p: ptr int128, expected: int128, val: int128): bool {.importc: "__sync_bool_compare_and_swap", nodecl.}
+  proc compareExchangeValImpl(p: ptr int128, expected: int128, val: int128): int128 {.importc: "__sync_val_compare_and_swap", nodecl.}
   # For compatability with atomic calls, convenience functions to discard the memory order
-  proc atomicAddFetch(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST): int128 {.inline.} =
+  proc addFetch(p: ptr int128, val: int128, mo = SeqCst): int128 {.inline.} =
     atomicAddFetchImpl p, val
-  proc atomicSubFetch(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST): int128 {.inline.} =
+  proc subFetch(p: ptr int128, val: int128, mo = SeqCst): int128 {.inline.} =
     atomicSubFetchImpl p, val
-  proc atomicLoadN(p: ptr int128, mo = ATOMIC_SEQ_CST): int128 {.inline.} =
+  proc loadN(p: ptr int128, mo = SeqCst): int128 {.inline.} =
     # Force cmpxchg16; __sync has no load
     atomicAddFetchImpl p, hint128(hi: 0'u, lo: 0'u)
-  proc atomicCompareExchangeN(p: ptr int128, expected: ptr int128, val: int128, weak = true, mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_SEQ_CST): bool {.inline.} =
+  proc atomicCompareExchangeN(p: ptr int128, expected: ptr int128, val: int128, weak = true, mo_succ = SeqCst, mo_fail = SeqCst): bool {.inline.} =
     atomicCompareExchangeImpl(p, expected[], val)
-  proc atomicStoreN(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST) {.inline.} =
+  proc atomicStoreN(p: ptr int128, val: int128, mo = SeqCst) {.inline.} =
     # A horrible solution; should strongly consider switching to clang after this
     while not atomicCompareExchangeImpl(p, p[], val):
       p[] = atomicLoadN(p)
@@ -74,40 +87,43 @@ type
   AtomicIntegers = ptr | pointer | uint64 | int64 | int | uint | int128 | hint128
 
 # Exported atomic ops
-proc addFetch*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = ATOMIC_SEQ_CST): T {.inline.} =
-  let pptr = addr p.val
+proc addFetch*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = SeqCst): T {.inline.} =
+  when p is ptr | pointer:
+    let pptr = p
+  else:
+    let pptr = addr p.val
   cast[T](
       atomicAddFetch(pptr, cast[typeof pptr[]](v), mo)
     )
-proc fetchAdd*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = ATOMIC_SEQ_CST): T {.inline.} =
+proc fetchAdd*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = SeqCst): T {.inline.} =
   let pptr = addr p.val
   cast[T](
     atomicFetchAdd(pptr, cast[typeof pptr[]](v), mo)
   )
-proc subFetch*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = ATOMIC_SEQ_CST): T {.inline.} =
+proc subFetch*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = SeqCst): T {.inline.} =
   let pptr = addr p.val
   cast[T](
       atomicSubFetch(pptr, cast[typeof pptr[]](v), mo)
     )
-proc fetchSub*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = ATOMIC_SEQ_CST): T {.inline.} =
+proc fetchSub*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = SeqCst): T {.inline.} =
   let pptr = addr p.val
   cast[T](
     atomicFetchSub(pptr, cast[typeof pptr[]](v), mo)
   )
-proc store*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = ATOMIC_SEQ_CST) {.inline.} =
+proc store*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = SeqCst) {.inline.} =
   let pptr = addr p.val
   atomicStoreN(pptr, cast[typeof pptr[]](v), mo)
-proc load*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; mo = ATOMIC_SEQ_CST): T {.inline.} =
+proc load*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; mo = SeqCst): T {.inline.} =
   let pptr = addr p.val
   cast[T](
     atomicLoadN(pptr, mo)
   )
-proc exchange*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; v: AtomicIntegers; mo = ATOMIC_SEQ_CST): T {.inline.} =
+proc exchange*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; v: AtomicIntegers; mo = SeqCst): T {.inline.} =
   let pptr = addr p.val
   cast[T](
     atomicExchangeN(pptr, cast[typeof pptr[]](v), mo)
   )
-proc compareExchange*[T](p: ptr HyAtomic[T] | var HyAtomic[T], e: ptr T | var T, v: AtomicIntegers; weak = false; mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_SEQ_CST): bool {.inline.} =
+proc compareExchange*[T](p: ptr HyAtomic[T] | var HyAtomic[T], e: ptr T | var T, v: AtomicIntegers; weak = false; mo_succ = SeqCst, mo_fail = SeqCst): bool {.inline.} =
   let pptr = addr p.val
   when e is ptr T:
     let eptr = e

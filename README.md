@@ -16,7 +16,7 @@ research such as the BonsaiQ which is based on TSLQueue.
 The algorithm has almost been transcribed, working around numerous
 obstacles such as lack of DCAS operations on AMD64 w/ GCC toolchain.
 
-- [ ] Algorithm transcribed
+- [x] *Algorithm transcribed* - The algorithm has been transcribed but the atomics (among other things) have to be completely refactored to avoid any use of system lib
 
   - [ ] __sync legacy funcs for DCAS ops on GCC
   - [ ] Test DCAS ops
