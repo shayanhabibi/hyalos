@@ -119,7 +119,7 @@ proc batchNext*(val: HyalosInfo): ptr HyalosInfo {.inline.} =
 
 template doWhile*(cond: bool, body: untyped): untyped {.dirty.} =
   block doWhile:
-    while True:
+    while true:
       body
       if not cond:
         break doWhile

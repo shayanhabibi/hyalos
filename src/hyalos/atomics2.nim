@@ -40,7 +40,7 @@ when defined(clang) and (defined(amd64) or defined(x86)):
   proc atomicLoadN(p: ptr int128, mo = ATOMIC_SEQ_CST): int128 {.importc: "__atomic_load_n", nodecl.}
   proc atomicCompareExchangeN(p, expected: ptr int128, val: int128,
   weak: bool = false, mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_RELEASE): bool {.importc: "__atomic_compare_exchange_n", nodecl.}
-
+  proc atomicStoreN(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST) {.importc: "__atomic_store_n", nodecl.}
 elif defined(gcc) or defined(amd64):
   # GCC no longer emits cmpxchg16 for double word atomics
   # When using GCC, will use deprecated __sync funcs which still emit CMPXCHG16 instructions
@@ -59,6 +59,11 @@ elif defined(gcc) or defined(amd64):
     atomicAddFetchImpl p, hint128(hi: 0'u, lo: 0'u)
   proc atomicCompareExchangeN(p: ptr int128, expected: ptr int128, val: int128, weak = true, mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_SEQ_CST): bool {.inline.} =
     atomicCompareExchangeImpl(p, expected[], val)
+  proc atomicStoreN(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST) {.inline.} =
+    # A horrible solution; should strongly consider switching to clang after this
+    while not atomicCompareExchangeImpl(p, p[], val):
+      p[] = atomicLoadN(p)
+
 else:
   # Currently have not ported Hyaline-1 support for single word atomic only architectures
   {.error: "Compilation targets must support DCAS atomics; please submit an issue if this is erroneous".}
@@ -102,9 +107,13 @@ proc exchange*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; v: AtomicIntegers; mo = 
   cast[T](
     atomicExchangeN(pptr, cast[typeof pptr[]](v), mo)
   )
-proc compareExchange*[T](p, e: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; weak = false; mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_SEQ_CST): bool {.inline.} =
+proc compareExchange*[T](p: ptr HyAtomic[T] | var HyAtomic[T], e: ptr T | var T, v: AtomicIntegers; weak = false; mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_SEQ_CST): bool {.inline.} =
   let pptr = addr p.val
-  let eptr = addr e.val
+  when e is ptr T:
+    let eptr = e
+  else:
+    let eptr = addr e
   cast[bool](
     atomicCompareExchangeN(pptr, eptr, cast[typeof pptr[]](v), weak, mo_succ, mo_fail)
   )
+
