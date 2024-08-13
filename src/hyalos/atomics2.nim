@@ -70,6 +70,21 @@ proc addFetch*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = 
   cast[T](
       atomicAddFetch(pptr, cast[typeof pptr[]](v), mo)
     )
+proc fetchAdd*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = ATOMIC_SEQ_CST): T {.inline.} =
+  let pptr = addr p.val
+  cast[T](
+    atomicFetchAdd(pptr, cast[typeof pptr[]](v), mo)
+  )
+proc subFetch*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = ATOMIC_SEQ_CST): T {.inline.} =
+  let pptr = addr p.val
+  cast[T](
+      atomicSubFetch(pptr, cast[typeof pptr[]](v), mo)
+    )
+proc fetchSub*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = ATOMIC_SEQ_CST): T {.inline.} =
+  let pptr = addr p.val
+  cast[T](
+    atomicFetchSub(pptr, cast[typeof pptr[]](v), mo)
+  )
 proc store*[T](p: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; mo = ATOMIC_SEQ_CST) {.inline.} =
   let pptr = addr p.val
   atomicStoreN(pptr, cast[typeof pptr[]](v), mo)

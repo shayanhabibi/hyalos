@@ -11,9 +11,6 @@ const
 func invPtr*[T](): T {.inline.} =
   cast[T](high(uint64))
 
-template WFR_RNODE*(n: typed): untyped =
-  discard
-
 type
   UnionWordPair = object
     data {.align:16.}: HyAtomic[hint128]
@@ -115,7 +112,14 @@ proc birthEpoch*(val: HyalosInfo): uint64 {.inline.} =
   cast[uint64](val.hyUnion1)
 
 # Union Handling - HyalosInfo Union 2
-proc refs*(val: HyalosInfo): uint64 {.inline.} =
-  cast[uint64](val.hyUnion2)
+proc refs*(val: HyalosInfo): HyAtomic[uint64] {.inline.} =
+  cast[HyAtomic[uint64]](val.hyUnion2)
 proc batchNext*(val: HyalosInfo): ptr HyalosInfo {.inline.} =
   cast[ptr HyalosInfo](val.hyUnion2)
+
+template doWhile*(cond: bool, body: untyped): untyped {.dirty.} =
+  block doWhile:
+    while True:
+      body
+      if not cond:
+        break doWhile
