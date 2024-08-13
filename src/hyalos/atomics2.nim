@@ -38,6 +38,8 @@ when defined(clang) and (defined(amd64) or defined(x86)):
   proc atomicAddFetch(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST): int128 {.importc: "__atomic_add_fetch", nodecl.}
   proc atomicSubFetch(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST): int128 {.importc: "__atomic_sub_fetch", nodecl.}
   proc atomicLoadN(p: ptr int128, mo = ATOMIC_SEQ_CST): int128 {.importc: "__atomic_load_n", nodecl.}
+  proc atomicCompareExchangeN(p, expected: ptr int128, val: int128,
+  weak: bool = false, mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_RELEASE): bool {.importc: "__atomic_compare_exchange_n", nodecl.}
 
 elif defined(gcc) or defined(amd64):
   # GCC no longer emits cmpxchg16 for double word atomics
@@ -45,7 +47,8 @@ elif defined(gcc) or defined(amd64):
   # Note that __sync calls are full synchronisations (more cost)
   proc atomicAddFetchImpl(p: ptr int128, val: int128): int128 {.importc: "__sync_add_and_fetch", nodecl.}
   proc atomicSubFetchImpl(p: ptr int128, val: int128): int128 {.importc: "__sync_sub_and_fetch", nodecl.}
-
+  proc atomicCompareExchangeImpl(p: ptr int128, expected: int128, val: int128): bool {.importc: "__sync_bool_compare_and_swap", nodecl.}
+  proc atomicCompareExchangeValImpl(p: ptr int128, expected: int128, val: int128): int128 {.importc: "__sync_val_compare_and_swap", nodecl.}
   # For compatability with atomic calls, convenience functions to discard the memory order
   proc atomicAddFetch(p: ptr int128, val: int128, mo = ATOMIC_SEQ_CST): int128 {.inline.} =
     atomicAddFetchImpl p, val
@@ -54,7 +57,8 @@ elif defined(gcc) or defined(amd64):
   proc atomicLoadN(p: ptr int128, mo = ATOMIC_SEQ_CST): int128 {.inline.} =
     # Force cmpxchg16; __sync has no load
     atomicAddFetchImpl p, hint128(hi: 0'u, lo: 0'u)
-
+  proc atomicCompareExchangeN(p: ptr int128, expected: ptr int128, val: int128, weak = true, mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_SEQ_CST): bool {.inline.} =
+    atomicCompareExchangeImpl(p, expected[], val)
 else:
   # Currently have not ported Hyaline-1 support for single word atomic only architectures
   {.error: "Compilation targets must support DCAS atomics; please submit an issue if this is erroneous".}
@@ -97,4 +101,10 @@ proc exchange*[T](p: ptr HyAtomic[T] | var HyAtomic[T]; v: AtomicIntegers; mo = 
   let pptr = addr p.val
   cast[T](
     atomicExchangeN(pptr, cast[typeof pptr[]](v), mo)
+  )
+proc compareExchange*[T](p, e: ptr HyAtomic[T] | var HyAtomic[T], v: AtomicIntegers; weak = false; mo_succ = ATOMIC_SEQ_CST, mo_fail = ATOMIC_SEQ_CST): bool {.inline.} =
+  let pptr = addr p.val
+  let eptr = addr e.val
+  cast[bool](
+    atomicCompareExchangeN(pptr, eptr, cast[typeof pptr[]](v), weak, mo_succ, mo_fail)
   )
