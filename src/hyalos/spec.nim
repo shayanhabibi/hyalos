@@ -1,5 +1,5 @@
-import hyalos/atomics2
 import hyalos/memalloc
+import pkg/nuclear
 
 const
   cacheLineSize* {.intdefine.} = 128 ## Size of local cache line; TODO automate
@@ -13,7 +13,7 @@ func invPtr*[T](): T {.inline.} =
 
 type
   UnionWordPair = object
-    data {.align:16.}: HyAtomic[hint128]
+    data {.align:16.}: Nuclear[hint128]
   UnionValuePair = distinct array[2, uint64]
   UnionDoubleWidth = distinct array[2, uint64]
   UnionLongLong = distinct uint64
@@ -25,10 +25,7 @@ proc `==`*(x,y: UnionDoubleWidth): bool {.borrow.}
 template padding(T: typedesc): int =
   ## Convenience internal template
   ## used in array padding
-  if sizeof(T) mod cacheLineSize != 0:
-    cacheLineSize - (sizeof(T) mod cacheLineSize)
-  else:
-    cacheLineSize
+  cacheLineSize - (sizeof(T) mod cacheLineSize)
 
 type
   Padded*[T] = object
@@ -43,14 +40,14 @@ converter unwrap*[T](pad: Padded[T]): T =
 type
   HyalosState* = object
     hyResult*: UnionWordPair
-    hyEpoch*: HyAtomic[uint64]
-    hyPointer*: HyAtomic[uint64]
-    hyParent*: HyAtomic[ptr HyalosInfo]
+    hyEpoch*: Nuclear[uint64]
+    hyPointer*: Nuclear[uint64]
+    hyParent*: Nuclear[ptr HyalosInfo]
     _: pointer
 
   HyalosInfo* = object
     hyUnion1*: UnionLongLong
-    batchLink*: HyAtomic[ptr HyalosInfo]
+    batchLink*: Nuclear[ptr HyalosInfo]
     hyUnion2*: UnionLongLong
 
   HyalosBatch* = object # Align 16
@@ -75,14 +72,21 @@ type
     slots* {.align: 16.}: ptr array[N, HyalosSlot]
     batches* {.align: 16.}: ptr array[N, HyalosBatch]
     allocCounters*: ptr array[N, Padded[uint64]]
-    epoch*: Padded[HyAtomic[uint64]]
-    slowCounter*: Padded[HyAtomic[uint64]]
+    epoch: Padded[Nuclear[uint64]]
+    slowCounter: Padded[Nuclear[uint64]]
   HyalosTracker*[T; N: static int] = ref HyalosTrackerObj[T, N] # Has to be ordered after Obj or invalid nimskull issue 1413
 
 proc `=destroy`*[T; N: static int](self: var HyalosTrackerObj[T, N]) =
   deallocAligned(self.batches, 16)
   deallocAligned(self.slots, 16)
   deallocShared(self.allocCounters)
+
+func `[]`*[T; N: static int](self: HyalosTracker[T, N]; idx: int): ptr HyalosSlot {.inline.} =
+  return self.slots[idx]
+func epoch*[T; N](self: HyalosTracker[T, N]): ptr Nuclear[uint64] {.inline.} =
+  return addr self.epoch.data
+func slowCounter*[T; N: static int](self: HyalosTracker[T, N]): ptr Nuclear[uint64] {.inline.} =
+  return addr self.slowCounter.data
 
 ##  To make conversion of the algorithm easier, distinct arrays
 ##  are used to represent unions with convenience templates
@@ -97,29 +101,36 @@ proc list*(val: var UnionValuePair): ptr array[2, ptr HyalosInfo] {.inline.} =
   cast[ptr array[2, ptr HyalosInfo]](addr val)
 
 # Union Handling
-proc full*(val: var UnionWordPair): ptr HyAtomic[hint128] {.inline.} = addr val.data
-proc pair*(val: var UnionWordPair): ptr array[2, HyAtomic[uint64]] {.inline.} =
-  cast[ptr array[2, HyAtomic[uint64]]](addr val.data)
-proc list*(val: var UnionWordPair): ptr array[2, HyAtomic[ptr HyalosInfo]] {.inline.} =
-  cast[ptr array[2, HyAtomic[ptr HyalosInfo]]](addr val.data)
+proc full*(val: var UnionWordPair): ptr Nuclear[hint128] {.inline.} = addr val.data
+proc pair*(val: var UnionWordPair): ptr array[2, Nuclear[uint64]] {.inline.} =
+  cast[ptr array[2, Nuclear[uint64]]](addr val.data)
+proc list*(val: var UnionWordPair): ptr array[2, Nuclear[ptr HyalosInfo]] {.inline.} =
+  cast[ptr array[2, Nuclear[ptr HyalosInfo]]](addr val.data)
 
 # Union Handling - HyalosInfo Union 1
 proc next*(val: HyalosInfo):  ptr HyalosInfo {.inline.} =
   cast[ptr HyalosInfo](val.hyUnion1)
+proc next*(val: ptr HyalosInfo): ptr HyalosInfo {.inline.} =
+  cast[ptr HyalosInfo](val[].hyUnion1)
+proc `next=`*(val: var HyalosInfo; newVal: ptr HyalosInfo) {.inline.} =
+  val.hyUnion1 = cast[UnionLongLong](newVal)
 proc slot*(val: HyalosInfo): ptr UnionWordPair {.inline.} =
   cast[ptr UnionWordPair](val.hyUnion1)
 proc birthEpoch*(val: HyalosInfo): uint64 {.inline.} =
   cast[uint64](val.hyUnion1)
 
 # Union Handling - HyalosInfo Union 2
-proc refs*(val: HyalosInfo): HyAtomic[uint64] {.inline.} =
-  cast[HyAtomic[uint64]](val.hyUnion2)
+proc refs*(val: HyalosInfo): ptr Nuclear[uint64] {.inline.} =
+  cast[ptr Nuclear[uint64]](addr val.hyUnion2)
 proc batchNext*(val: HyalosInfo): ptr HyalosInfo {.inline.} =
   cast[ptr HyalosInfo](val.hyUnion2)
 
 template doWhile*(cond: bool, body: untyped): untyped {.dirty.} =
-  block doWhile:
+  block nene:
     while true:
       body
       if not cond:
-        break doWhile
+        break nene
+
+proc exchange*(p: ptr HyalosInfo; q: pointer, mo: static MemoryOrder = moSeqCst): ptr HyalosInfo {.inline.} =
+  return cast[ptr HyalosInfo]( cast[ptr Nuclear[ptr HyalosInfo]](addr p).exchange(cast[typeof result](q), mo) )
