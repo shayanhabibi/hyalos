@@ -108,7 +108,7 @@ proc list*(val: var UnionWordPair): ptr array[2, Nuclear[ptr HyalosInfo]] {.inli
   cast[ptr array[2, Nuclear[ptr HyalosInfo]]](addr val.data)
 
 # Union Handling - HyalosInfo Union 1
-proc next*(val: HyalosInfo):  ptr HyalosInfo {.inline.} =
+proc next*(val: var HyalosInfo):  ptr HyalosInfo {.inline.} =
   cast[ptr HyalosInfo](val.hyUnion1)
 proc next*(val: ptr HyalosInfo): ptr HyalosInfo {.inline.} =
   cast[ptr HyalosInfo](val[].hyUnion1)

@@ -16,7 +16,11 @@ const
       else: 8
     else: 16
 
-
+template alignByBits*(bits: Natural): Natural =
+  ## Aligns the given number of bits to the next multiple of 2^bits.
+  ## For example, alignByBits(4) will align to the next multiple of 16.
+  ## This is useful for SIMD operations.
+  (1 shl bits) - 1
 
 
 when not defined(js):

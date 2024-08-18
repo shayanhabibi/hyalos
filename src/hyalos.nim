@@ -8,7 +8,6 @@ template rNode[T](p: T): T =
 template isRNode[T](p: T): bool =
   bool(cast[uint64](p) and 1'u64)
 
-
 proc helpThread*[T, N](tracker: HyalosTracker[T,N]; tid, index, mytid: int) {.inline.}
   # Forward decl
 
@@ -66,7 +65,7 @@ proc traverse[T,N](tracker: HyalosTracker[T, N]; list: ptr ptr HyalosInfo; next:
         # moveMem(refs[].hyUnion1.addr, list, sizeof(ptr HyalosInfo)) # refs[].next = list[]
         list[] = refs
       break
-    var next = curr.next.exchange(invPtr[pointer](), moAcqRel)
+    (unsafeAddr next)[] = curr.next.exchange(invPtr[pointer](), moAcqRel)
     var refs: ptr HyalosInfo
     refs = curr.batchLink.load(moRelaxed)
     if truthy refs:
@@ -298,7 +297,7 @@ proc tryRetire[T, N](tracker: HyalosTracker[T, N]; batch: ptr HyalosBatch) =
   batch.counter = 0
 
 
-proc retire[T, N](tracker: HyalosTracker[T, N]; obj: ptr T; tid: int) =
+proc retire*[T, N](tracker: HyalosTracker[T, N]; obj: ptr T; tid: int) =
   if obj.isNil: return
   var node: ptr HyalosInfo = cast[ptr HyalosInfo](cast[uint64](obj) + 1)
   if not tracker.batches[tid].first:
@@ -343,7 +342,7 @@ proc reserveSlot[T, N](tracker: HyalosTracker[T, N]; obj: ptr T; index, tid: int
   return tracker.slowPath(cast[ptr Nuclear[ptr T]](nil), index, tid, node)
 
 
-proc read[T,N](tracker: HyalosTracker[T,N]; obj: ptr Nuclear[ptr T]; index, tid: int; node: ptr T): ptr T =
+proc read*[T,N](tracker: HyalosTracker[T,N]; obj: ptr Nuclear[ptr T]; index, tid: int; node: ptr T): ptr T =
   var prevEpoch: uint64
   var attempts: int
 
@@ -508,7 +507,7 @@ proc helpRead[T, N](tracker: HyalosTracker[T,N], mytid: int) =
         # Check if the result pointer is invalid
         checkPtrs(i, j)
 
-proc alloc[T,N](tracker: HyalosTracker[T, N], tid: int): pointer =
+proc alloc*[T,N](tracker: HyalosTracker[T, N], tid: int): pointer =
   tracker.allocCounters[tid] = tracker.allocCounters[tid] +% 1
   if (tracker.allocCounters[tid] mod tracker.epochFreq) == 0:
     # help other threads first
@@ -519,6 +518,34 @@ proc alloc[T,N](tracker: HyalosTracker[T, N], tid: int): pointer =
   var info: ptr HyalosInfo = result +% sizeof T
   info.birthEpoch = tracker.getEpoch()
   info.batchLink.store(nil, moRelaxed)
+
+# proc allocAligned[T,N](tracker: HyalosTracker[T, N], tid: int, align: static Natural): pointer =
+#   const
+#     MemAlign = # also minimal allocatable memory block
+#       when defined(useMalloc):
+#         when defined(amd64): 16
+#         else: 8
+#       else: 16
+#   ## ALIGN BY NUMBER OF BITS
+#   template alignByBits(align: Natural): Natural =
+#     (1 shl align) - 1
+#   template `+!`(p: pointer, s: SomeInteger): pointer =
+#     cast[pointer](cast[int](p) +% int(s))
+#   template `-!`(p: pointer, s: SomeInteger): pointer =
+#     cast[pointer](cast[int](p) -% int(s))
+
+#   template size: Natural = sizeof HyalosInfo + sizeof T
+
+#   when align <= MemAlign:
+#     result = allocShared(size)
+#   else:
+#     # allocate (size + align - 1) necessary for alignment,
+#     # plus 2 bytes to store offset
+#     let base = allocShared(size + alignByBits align + sizeof(uint16))
+#     let offset = (1 shl align) - (cast[int](base) and (alignByBits align))
+#     cast[ptr uint16](base +! (offset - sizeof(uint16)))[] = uint16(offset)
+#     result = base +! offset
+
 
 proc newHyalosTracker*[T; N: static int](hrNum, epochFreq, emptyFreq: int; collect: bool = false): HyalosTracker[T, N] =
   ## Creates a new instance of the HyalosTracker[T, N] type.
