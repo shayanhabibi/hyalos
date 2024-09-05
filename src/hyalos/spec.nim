@@ -1,12 +1,14 @@
 import hyalos/memalloc
 import pkg/nuclear
+import pkg/parith/math
 
 const
   cacheLineSize* {.intdefine.} = 128 ## Size of local cache line; TODO automate
-  MAX_WFR = 16
-  MAX_WFRC = 12
-  WFR_PROTECT1 = 1'u64 shl 63
-  WFR_PROTECT2 = 1'u64 shl 62
+  MAX_WFR* = 16
+  MAX_WFRC* = 12
+  WFR_PROTECT1* = 1'u64 shl 63
+  WFR_PROTECT2* = 1'u64 shl 62
+  INVPTR* = high(uint64)
 
 func invPtr*[T](): T {.inline.} =
   cast[T](high(uint64))
@@ -41,7 +43,6 @@ converter unwrap*[T](pad: Padded[T]): T =
 type
   UnionWordPair = hint128
   UnionValuePair = array[2, uint64]
-  UnionDoubleWidth = array[2, uint64]
   UnionLongLong = uint64
 
   HyalosInfo* = ptr HyalosInfoObj
@@ -65,8 +66,8 @@ type
     list*:  HyalosInfo
     _: array[hyalosBatchPadding, char]
 
-  HyalosBatchesArray*[N] = array[N, HyalosBatch]
-  HyalosBatches*[N] = ptr HyalosBatchesArray[N]
+  HyalosBatchesArray*[N: static int] = array[N, HyalosBatch]
+  HyalosBatches*[N: static int] = ptr HyalosBatchesArray[N]
 
   HyalosSlot* = object # Align 16
     first*: array[MAX_WFR, UnionWordPair]
@@ -74,11 +75,11 @@ type
     state*: array[MAX_WFR, HyalosState]
     _: array[hyalosSlotPadding, char]
 
-  HyalosSlotsArray*[N] = array[N, HyalosSlot]
-  HyalosSlots*[N] = ptr HyalosSlotsArray[N]
+  HyalosSlotsArray*[N: static int] = array[N, HyalosSlot]
+  HyalosSlots*[N: static int] = ptr HyalosSlotsArray[N]
 
-  HyalosCountersArray*[N] = array[N, Padded[uint64]]
-  HyalosCounters*[N] = ptr HyalosCountersArray[N]
+  HyalosCountersArray*[N: static int] = array[N, Padded[uint64]]
+  HyalosCounters*[N: static int] = ptr HyalosCountersArray[N]
 
   HyalosTrackerObj*[T; N: static int] = object
     hrNum*: int
@@ -116,22 +117,26 @@ func slowCounter*[T; N](self: HyalosTracker[T, N]): var Nuclear[uint64] {.inline
 
 # Union Handling
 template full*(val: var UnionValuePair): untyped = val
-template pair*(val: var UnionValuePair): array[2, uint64] = cast[array[2, uint64]](val)
-template list*(val: var UnionValuePair): array[2, HyalosInfo] = cast[array[2, HyalosInfo]](val)
+template pair*(val: var UnionValuePair): ptr array[2, uint64] = cast[ptr array[2, uint64]](addr val)
+template list*(val: var UnionValuePair): ptr array[2, HyalosInfo] = cast[ptr array[2, HyalosInfo]](addr val)
 
 # Union Handling
-template full*(val: var UnionWordPair): Nuclear[hint128] = cast[Nuclear[hint128]](val)
-template pair*(val: var UnionWordPair): array[2, Nuclear[uint64]] = cast[array[2, Nuclear[uint64]]](val)
-template list*(val: var UnionWordPair): array[2, Nuclear[HyalosInfo]] = cast[array[2, Nuclear[HyalosInfo]]](val)
+template full*(val: var UnionWordPair): Nuclear[hint128] = cast[ptr Nuclear[hint128]](addr val)[]
+template pair*(val: var UnionWordPair): ptr array[2, Nuclear[uint64]] = cast[ptr array[2, Nuclear[uint64]]](addr val)
+template list*(val: var UnionWordPair): ptr array[2, Nuclear[HyalosInfo]] = cast[ptr array[2, Nuclear[HyalosInfo]]](addr val)
 
 # Union Handling - HyalosInfo Union 1
-template next*(val: HyalosInfo): Nuclear[HyalosInfo] = cast[Nuclear[HyalosInfo]](val.hyUnion1)
+template next*(val: HyalosInfo): ptr Nuclear[HyalosInfo] = cast[ptr Nuclear[HyalosInfo]](addr val.hyUnion1)
 template slot*(val: HyalosInfo): ptr UnionWordPair = cast[ptr UnionWordPair](val.hyUnion1)
 template birthEpoch*(val: HyalosInfo): untyped = val.hyUnion1
 
 # Union Handling - HyalosInfo Union 2
-template refs*(val: HyalosInfo): Nuclear[uint64] = cast[Nuclear[uint64]](val.hyUnion2)
+template refs*(val: HyalosInfo): Nuclear[uint64] = cast[ptr Nuclear[uint64]](addr val.hyUnion2)[]
 template batchNext*(val: HyalosInfo): HyalosInfo = cast[HyalosInfo](val.hyUnion2)
+
+template `==`*(x: UnionValuePair, y: hint128): bool = cast[hint128](x) == y
+
+template mut*[T](val: T): var T = cast[var T](addr val)
 
 template doWhile*(cond: bool, body: untyped): untyped {.dirty.} =
   block nene:
@@ -140,7 +145,13 @@ template doWhile*(cond: bool, body: untyped): untyped {.dirty.} =
       if not cond:
         break nene
 
-# import hyalos/memalloc {.all.}
+template getInfo*[T](p: ptr T): HyalosInfo =
+  ## Navigate to the Info suffix from a pointer
+  cast[HyalosInfo](p +! 1)
+
+template getNode*[T](info: HyalosInfo): ptr T =
+  ## Navigate to the Node prefix from an Info
+  cast[ptr T](info) -! 1
 
 # proc alloc[N](hyalos: HyalosTracker[N]; size: Natural; align: static Natural = MemAlign): pointer =
 #   ## Allocate memory that is tracked by the HyalosTracker

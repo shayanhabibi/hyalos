@@ -2,11 +2,18 @@ import hyalos/memalloc
 import hyalos/spec {.all.}
 
 import pkg/nuclear
+import pkg/parith/[math, bitops]
+## Parith (ptr arithmetic) module introduces annotated operators for ptr arithmetic
+## such as `+!`, `-!`, `&!`, `|!`, `^!`, `~!`, `<<!`, `>>!`, `==!`, `!=!` in a similar
+## fashion to ptr arithmetic in C/C++.
+
+export `~` # hint128 sugar
+export spec
 
 template rNode[T](p: T): T =
-  cast[T](cast[uint64](p) xor 1'u64)
+  p ^! 1 # ptr xor
 template isRNode[T](p: T): bool =
-  bool(cast[uint64](p) and 1'u64)
+  bool( cast[uint64](p) and 1'u64 )
 
 proc helpThread*[T; N](tracker: HyalosTracker[T, N]; tid, index, mytid: int) {.inline.}
   # Forward decl
@@ -38,9 +45,10 @@ proc getRefsNode[T; N](tracker: HyalosTracker[T, N], node: HyalosInfo): HyalosIn
     refs = node
   return refs
 
-proc reclaim(obj: pointer) =
-# proc reclaim[T](obj: ptr T) =
-  # `=destroy`(obj[])
+# proc reclaim(obj: pointer) =
+  # deallocShared(obj)
+proc reclaim[T; N](tracker: HyalosTracker[T, N]; obj: ptr T) =
+  `=destroy`(obj[]) # FIXME: is safe?
   deallocShared(obj)
 
 proc traverse[T; N](tracker: HyalosTracker[T, N]; list: ptr HyalosInfo; next: HyalosInfo) =
@@ -62,15 +70,15 @@ proc traverse[T; N](tracker: HyalosTracker[T, N]; list: ptr HyalosInfo; next: Hy
       var refs: HyalosInfo
       refs = rNode curr
       if truthy refs:
-        refs.next = list[]
-        # moveMem(refs[].hyUnion1.addr, list, sizeof(ptr HyalosInfo)) # refs[].next = list[]
+        refs.next[] = cast[Nuclear[HyalosInfo]](list[])
         list[] = refs
       break
-    next = curr.next.exchange(invPtr[pointer](), moAcqRel)
+    mut next = exchange( curr.next, INVPTR, moAcqRel )
+
     var refs: HyalosInfo
-    refs = curr.batchLink.load(moRelaxed)
+    refs = load( curr.batchLink, moRelaxed )
     if truthy refs:
-      refs.next = list[]
+      refs.next[] = cast[Nuclear[HyalosInfo]](list[])
       list[] = refs
 
 proc freeList[T; N](tracker: HyalosTracker[T, N], list: var HyalosInfo) {.inline.} =
@@ -83,406 +91,556 @@ proc freeList[T; N](tracker: HyalosTracker[T, N], list: var HyalosInfo) {.inline
 
   # Iterate through the linked list
   while not list.isNil():
-    var start: HyalosInfo = rNode list.batchLink.load(moRelaxed)
-    list = list.next
+    var start: HyalosInfo = rNode load( list.batchLink, moRelaxed )
+    # list = list.next # lets just use atomic load
+    list = load( list.next, moRelaxed )
     # Iterate through the batch of objects
     doWhile(not start.isNil()):
-      var obj: ptr T = cast[ptr T](cast[uint64](start) - sizeof(T).uint64)
+      var obj: ptr T = getNode[T](start)
       start = start.batchNext
       # Deallocate the object
-      reclaim obj
+      tracker.reclaim obj
 
-proc traverseCache[T; N](tracker: HyalosTracker[T, N]; batch: HyalosBatch; next: HyalosInfo) {.inline.} =
+proc traverseCache[T; N](tracker: HyalosTracker[T, N]; batch: var HyalosBatch; next: HyalosInfo) {.inline.} =
   if not isNil next:
     if batch.listCount == MAX_WFRC:
       tracker.freeList(batch.list)
-      batch.list = nil
+      batch.list      = nil
       batch.listCount = 0
 
     tracker.traverse( addr batch.list, next )
     inc batch.listCount
 
 
+# Slow path operation.
+# Involves updating various fields and performing compare-and-swap (CAS) operations.
+# Returns a pointer to the updated object.
+
+# PARAMETERS:
+# - `tracker`: The `HyalosTracker` instance used for tracking objects.
+# - `obj`: A pointer to the object being tracked.
+# - `index`: The index of the object in the tracker.
+# - `tid`: The thread ID associated with the object.
+# - `node`: A pointer to the node associated with the object.
+
+# DESCRIPTION:
+# - The procedure starts by initializing variables `birthEpoch` and `parent`.
+# - It then checks if the `node` is not nil and retrieves the `birthEpoch` from the parent node.
+# - Next, it retrieves the previous epoch from the tracker and increments the slow counter.
+# - Various fields in the tracker are updated using the `store` procedure.
+# - The procedure then enters a loop where it performs a compare-and-swap (CAS) operation to update the result field.
+# - Inside the loop, it checks if the current epoch is equal to the previous epoch.
+# - If they are equal, it updates the result field and other related fields.
+# - If not, it checks if the `first` field is not nil and updates the `first` field accordingly.
+# - The loop continues until the CAS operation is successful or the `first` field is not equal to the current sequence number.
+# - After the loop, the sequence number is incremented and various fields are updated.
+# - The result pointer is retrieved and checked for validity.
+# - If the result pointer is valid, it updates the reference count and performs additional operations.
+# - Finally, the slow counter is decremented and the procedure returns the result pointer.
+
 proc slowPath*[T; N](tracker: HyalosTracker[T, N]; obj: ptr Nuclear[ptr T]; index, tid: int; node: ptr T): ptr T =
   var birthEpoch: uint64
   var parent: HyalosInfo
 
+  # Retrieve the birth epoch and parent node information
   if not isNil node:
-    parent = cast[HyalosInfo](cast[uint64](node) + sizeof(T).uint64)
-    birthEpoch =  parent.birthEpoch
+    parent      = getInfo node
+    birthEpoch  =  parent.birthEpoch
 
     var info: HyalosInfo
-    info = parent.batchLink.load(moAcquire)
+    info = load( parent.batchLink, moAcquire )
     if (not isNil info) and (not isRNode(info)):
       birthEpoch = info.birthEpoch
 
   var prevEpoch: uint64
-  prevEpoch = tracker.slots[tid].epoch[index].pair[0].load(moAcquire)
+  prevEpoch = load( tracker.slots[tid].epoch[index].pair[0], moAcquire )
   discard tracker.slowCounter.fetchAdd(1, moAcqRel)
-  tracker.slots[tid].state[index].hyPointer.store(cast[uint64](obj), moRelease)
-  tracker.slots[tid].state[index].hyParent.store(parent, moRelease)
-  tracker.slots[tid].state[index].hyEpoch.store(birthEpoch, moRelease)
+
+  # Update the shared state with the current object information
+  store( tracker.slots[tid].state[index].hyPointer, cast[uint64](obj),  moRelease )
+  store( tracker.slots[tid].state[index].hyParent,  parent,             moRelease )
+  store( tracker.slots[tid].state[index].hyEpoch,   birthEpoch,         moRelease )
 
   var seqno: uint64
   var lastResult: UnionValuePair
-  seqno = tracker.slots[tid].epoch[index].pair[1].load(moAcquire)
-  lastResult.pair[0] = invPtr[uint64]()
+  seqno = load( tracker.slots[tid].epoch[index].pair[1], moAcquire )
+  lastResult.pair[0] = INVPTR
   lastResult.pair[1] = seqno
 
-  tracker.slots[tid].state[index].hyResult.full.store(lastResult.full, moRelease) # DCAS
+  store( tracker.slots[tid].state[index].hyResult.full, lastResult.full, moRelease ) # DCAS
 
   var old, value: UnionValuePair
   var resultEpoch, resultPtr, expseqno: uint64
   var first: HyalosInfo
   block done: #`goto done` == break done
-    doWhile(resultPtr == invPtr[uint64]()):
-      var objPtr: ptr T = if obj: obj.load(moAcquire) else: cast[ptr T](nil)
-      var currEpoch: uint64 = tracker.getEpoch()
+    doWhile(resultPtr == INVPTR):
+      var
+        objPtr: ptr T     = if obj: load( obj, moAcquire ) else: cast[ptr T](nil)
+        currEpoch: uint64 = tracker.getEpoch()
+
+      # Check if the current epoch matches the previous epoch
       if currEpoch == prevEpoch:
-        lastResult.pair[0] = invPtr[uint64]()
-        lastResult.pair[1] = seqno
-        value.pair[0] = 0'u
-        value.pair[1] = 0'u
-        # DCAS
-        if tracker.slots[tid].state[index].hyResult.full.compareExchange(lastResult.full, value.full, moAcqRel, moAcquire):
-          tracker.slots[tid].epoch[index].pair[1].store(seqno +% 2, moRelease)
-          tracker.slots[tid].first[index].pair[1].store(seqno +% 2, moRelease)
+        lastResult.pair[0]  = INVPTR
+        lastResult.pair[1]  = seqno
+        value.pair[0]       = 0'u
+        value.pair[1]       = 0'u
+
+        # DCAS (Double Compare And Swap) operation to update the result field
+        if compareExchange( tracker.slots[tid].state[index].hyResult.full, lastResult.full, value.full, moAcqRel, moAcquire ):
+          store( tracker.slots[tid].epoch[index].pair[1], seqno +% 2, moRelease )
+          store( tracker.slots[tid].first[index].pair[1], seqno +% 2, moRelease )
           discard tracker.slowCounter.fetchSub(1'u, moAcqRel)
           return objPtr
-      if not tracker.slots[tid].first[index].list[0].load(moAcquire).isNil():
-        first = tracker.slots[tid].first[index].list[0].exchange(nil, moAcqRel)
-        if tracker.slots[tid].first[index].pair[1].load(moAcquire) != seqno:
+
+      # Check if the first field of the slot is not nil
+      if not isNil load( tracker.slots[tid].first[index].list[0], moAcquire ):
+        first = exchange( tracker.slots[tid].first[index].list[0], nil, moAcqRel )
+        if load( tracker.slots[tid].first[index].pair[1], moAcquire ) != seqno:
           break done
-        if first != invPtr[uint64]():
+        if first != INVPTR:
+          # Traverse the linked list of nodes and update the batch list
           traverseCache tracker, addr batches[tid], first
         currEpoch = getEpoch tracker
 
-      first = nil
-      old.pair[0] = prevEpoch
-      old.pair[1] = seqno
+      first         = nil
+      old.pair[0]   = prevEpoch
+      old.pair[1]   = seqno
       value.pair[0] = currEpoch
       value.pair[1] = seqno
-      discard compareExchange(tracker.slots[tid].epoch[index].full, old.full, value.full, moSeqCst, moAcquire) # DCAS
+
+      # DCAS (Double Compare And Swap) operation to update the epoch field
+      discard compareExchange(
+        tracker.slots[tid].epoch[index].full,
+        old.full,
+        value.full,
+        moSeqCst,
+        moAcquire
+      )
+
       prevEpoch = currEpoch
-      resultPtr = tracker.slots[tid].state[index].hyResult.pair[0].load(moAcquire)
+      resultPtr = load( tracker.slots[tid].state[index].hyResult.pair[0], moAcquire )
 
     expseqno = seqno
-    # DCAS
-    discard tracker.slots[tid].epoch[index].pair[1].compareExchange(expseqno, seqno +% 1, moAcqRel, moRelaxed)
+    # DCAS (Double Compare And Swap) operation to update the sequence number field
+    discard compareExchange(
+      tracker.slots[tid].epoch[index].pair[1],
+      expseqno,
+      seqno +% 1,
+      moAcqRel,
+      moRelaxed
+    )
 
     value.list[0] = nil
     value.pair[1] = seqno + 1
-    old.pair[1] = tracker.slots[tid].first[index].pair[1].load(moAcquire)
-    old.list[1] = tracker.slots[tid].first[index].list[0].load(moAcquire)
+    old.pair[1]   = load( tracker.slots[tid].first[index].pair[1], moAcquire  )
+    old.list[1]   = load( tracker.slots[tid].first[index].list[0], moAcquire  )
+
     while old.pair[1] == seqno: # v DCAS
-      if tracker.slots[tid].first[index].full.compareExchangeWeak(old.full, value.full, moAcqRel, moAcquire):
-        if old.list[0] != invPtr[uint64]():
+      # DCAS (Double Compare And Swap) operation to update the first field
+      if compareExchangeWeak(
+          tracker.slots[tid].first[index].full,
+          old.full,
+          value.full,
+          moAcqRel,
+          moAcquire
+        ):
+        if old.list[0] != INVPTR:
           first = old.list[0]
         break
 
   inc seqno
 
-  tracker.slots[tid].epoch[index].pair[1].store(seqno + 1'u, moRelease)
-  resultEpoch = tracker.slots[tid].state[index].hyResult.pair[1].load(moAcquire)
-  tracker.slots[tid].epoch[index].pair[0].store(resultEpoch, moRelease)
+  store( tracker.slots[tid].epoch[index].pair[1], seqno + 1'u, moRelease )
+  resultEpoch = load( tracker.slots[tid].state[index].hyResult.pair[1], moAcquire )
+  store( tracker.slots[tid].epoch[index].pair[0], resultEpoch, moRelease )
 
-  tracker.slots[tid].first[index].pair[1].store(seqno + 1, moRelease)
-  resultPtr = tracker.slots[tid].state[index].hyResult.pair[0].load(moAcquire) and 0xFFFFFFFFFFFFFFFC
+  store( tracker.slots[tid].first[index].pair[1], seqno + 1, moRelease )
+  resultPtr = 0xFFFFFFFFFFFFFFFC and load( tracker.slots[tid].state[index].hyResult.pair[0], moAcquire )
 
-  var ptrNode: HyalosInfo = cast[HyalosInfo](resultPtr +% sizeof(T))
+  var ptrNode: HyalosInfo = getInfo cast[ptr T](resultPtr)
 
-  if (resultPtr != 0'u) and (not ptrNode.batchLink.load(moAcquire).isNil()):
+  # Check if the result pointer is valid and update the reference count
+  if (resultPtr != 0'u) and (not isNil load( ptrNode.batchLink, moAcquire )):
     var refs: HyalosInfo = tracker.getRefsNode ptrNode
     discard refs.refs.fetchAdd(1'u, moAcqRel)
-    if first != invPtr[uint64]():
+    if first != INVPTR:
+      # Traverse the linked list of nodes and update the batch list
       tracker.traverseCache(addr tracker.batches[tid], first)
-    first = tracker.slots[tid].first[index].list[0].exchange(rNode(refs), moAcqRel)
+    first = exchange( tracker.slots[tid].first[index].list[0], rNode(refs), moAcqRel )
 
   discard tracker.slowCounter.fetchSub(1'u, moAcqRel)
 
-  if first != invPtr[uint64]():
+  if first != INVPTR:
+    # Traverse the linked list of nodes and update the batch list
     tracker.traverseCache(addr tracker.batches[tid], first)
 
-  if (not parent.isNil) and (not parent.batchLink.load(moAcquire).isNil):
+  if (not parent.isNil) and (not isNil load( parent.batchLink, moAcquire )):
     var refs: HyalosInfo = tracker.getRefsNode(parent)
     discard refs.refs.fetchAdd(WFR_PROTECT2, moAcqRel)
     var adjs = not WFR_PROTECT2
 
     for i in 0..<N:
       var exp: HyalosInfo = parent
-      if tracker.slots[i].state[tracker.hrNum].hyParent.compareExchange(exp, nil, moAcqRel, moRelaxed):
+      if compareExchange(tracker.slots[i].state[tracker.hrNum].hyParent, exp, nil, moAcqRel, moRelaxed ):
         inc adjs
 
     discard refs.refs.fetchAdd(adjs, moAcqRel)
 
   return cast[ptr T](resultPtr)
 
-proc clearAll[T; N](tracker: HyalosTracker[T,N]; tid: int) =
+proc clearAll*[T; N](tracker: HyalosTracker[T,N]; tid: int) =
   var first: array[MAX_WFR, HyalosInfo]
-  for i in 0..<tracker.hrNum:
-    first[i] = tracker.slots[tid].first[i].list[0].exchange(invPtr[uint64](), moAcqRel)
-  for i in 0..<tracker.hrNum:
-    if first[i] != invPtr[uint64]():
-      tracker.traverse(addr tracker.batches[tid].list, first[i])
-  tracker.freeList(tracker.batches[tid].list)
-  tracker.batches[tid].list = nil
-  tracker.batches[tid].listCount = 0
 
-proc tryRetire[T, N](tracker: HyalosTracker[T, N]; batch: ptr HyalosBatch) =
+  for i in 0..<tracker.hrNum:
+    first[i] = exchange( tracker.slots[tid].first[i].list[0], INVPTR, moAcqRel )
+  for i in 0..<tracker.hrNum:
+    if first[i] != INVPTR:
+      tracker.traverse(addr tracker.batches[tid].list, first[i])
+
+  tracker.freeList(tracker.batches[tid].list)
+  tracker.batches[tid].list       = nil
+  tracker.batches[tid].listCount  = 0
+
+proc tryRetire*[T, N](tracker: HyalosTracker[T, N]; batch: ptr HyalosBatch) =
+  # Retire unused memory slots in HyalosBatch
+  #
+  # Iterates over the memory slots in the batch and checks if they can be retired based on certain conditions.
+  # If a memory slot can be retired, it is marked as retired and the necessary adjustments are made to the tracker.
+  # Finally, if all the memory slots in the batch have been retired, the batch is freed.
+
   var
-    curr: HyalosInfo = batch.first
-    refs: HyalosInfo = batch.last
-    minEpoch: uint64 = refs.birthEpoch
-    last: HyalosInfo = curr
+    curr: HyalosInfo = batch.first  # Current HyalosInfo node being processed
+    refs: HyalosInfo = batch.last   # Last HyalosInfo node in the batch
+    minEpoch: uint64 = refs.birthEpoch  # Minimum birth epoch among all nodes in the batch
+    last: HyalosInfo = curr         # Last processed HyalosInfo node
 
   for i in 0..<N:
     var j = 0
     while j < tracker.hrNum:
       inc j
 
-      var first: ptr HyalosInfo = tracker.slots[i].first[j].list[0].load(moAcquire)
-      if first == invPtr[uint64]():
+      var first: HyalosInfo = load( tracker.slots[i].first[j].list[0], moAcquire )
+      if first ==! INVPTR:
         continue
-      if tracker.slots[i].first[j].pair[1].load(moAcquire) and 1'u:
+      if load( tracker.slots[i].first[j].pair[1], moAcquire ) and 1'u:
         continue
-      var epoch: uint64 = tracker.slots[i].epoch[j].pair[0].load(moAcquire)
+      var epoch: uint64 = load( tracker.slots[i].epoch[j].pair[0], moAcquire )
       if epoch < minEpoch:
         continue
-      if tracker.slots[i].epoch[j].pair[1].load(moAcquire) and 1'u:
+      if load( tracker.slots[i].epoch[j].pair[1], moAcquire ) and 1'u:
         continue
       if last == refs:
         return
       last.slot = addr tracker.slots[i].first[j]
       last = last.batchNext
-    while j < tracker.hrNum + 2:
+
+    while j < (tracker.hrNum + 2):
       inc j
-      var first: ptr HyalosInfo = tracker.slots[i].first[j].list[0].load(moAcquire)
-      if first == invPtr[uint64]():
+      var first: HyalosInfo = load( tracker.slots[i].first[j].list[0], moAcquire )
+      if first ==! INVPTR:
         continue
-      var epoch: uint64 = tracker.slots[i].epoch[j].pair[0].load(moAcquire)
+      var epoch: uint64 = load( tracker.slots[i].epoch[j].pair[0], moAcquire )
       if epoch < minEpoch:
         continue
       if last == refs:
         return
       last.slot = addr tracker.slots[i].first[j]
       last = last.batchNext
-  var adjs = not WFR_PROTECT1
+
+  var adjs = not WFR_PROTECT1  # Number of adjustments to be made to the reference count
+
   while curr != last:
     curr = curr.batchNext
 
-    var slotFirst: ptr UnionWordPair = curr.slot
-    var slotEpoch: ptr UnionWordPair = cast[ptr UnionWordPair](cast[uint64](slotFirst) + MAX_WFR)
-    curr.next.store(nil, moRelaxed)
-    if slotFirst.list[0].load(moAcquire) == invPtr[uint64]():
+    var
+      slotFirst: ptr UnionWordPair = curr.slot  # Pointer to the first field of the memory slot
+      slotEpoch: ptr UnionWordPair = slotFirst +! MAX_WFR  # Pointer to the epoch field of the memory slot
+
+    store( curr.next, nil, moRelaxed )  # Set the next field of the current node to nil
+
+    if load( slotFirst.list[0], moAcquire ) == INVPTR:
       continue
-    var epoch: uint64 = slotEpoch.pair[0].load(moAcquire)
+
+    var epoch: uint64 = load( slotEpoch.pair[0], moAcquire )
     if epoch < minEpoch:
       continue
-    var prev: HyalosInfo = slotFirst.list[0].exchange(curr, moAcqRel)
+
+    var prev: HyalosInfo = exchange( slotFirst.list[0], curr, moAcqRel )  # Atomically exchange the first field with the current node
     if not prev.isNil:
-      if prev == invPtr[ptr HyalosInfo]():
+      if prev ==! INVPTR:
         var exp: HyalosInfo = curr
-        if slotFirst.list[0].compareExchange(exp, invPtr[uint64], moAcqRel, moRelaxed):
+        if compareExchange( slotFirst.list[0], exp, INVPTR, moAcqRel, moRelaxed ):
           continue
       else:
         var exp: HyalosInfo = nil
-        if not curr.next.compareExchange(exp, prev, moAcqRel, moRelaxed):
+        if not compareExchange( curr.next, exp, prev, moAcqRel, moRelaxed ):
           var list: HyalosInfo = nil
-          tracker.traverse(addr list, prev)
-          tracker.freeList(list)
-    inc adjs
+          tracker.traverse(addr list, prev)  # Traverse the linked list of nodes and update the batch list
+          tracker.freeList(list)  # Free the retired nodes
+
+    inc adjs  # Increment the number of adjustments
+
   if refs.refs.fetchAdd(adjs, moAcqRel) == -adjs:
     refs.next = nil
-    tracker.freeList(refs)
+    tracker.freeList(refs)  # Free the batch if all nodes have been retired
+
   batch.first = nil
-  batch.counter = 0
+  batch.counter = 0  # Reset the batch counter
 
 
 proc retire*[T, N](tracker: HyalosTracker[T, N]; obj: ptr T; tid: int) =
+  # Retire a node in the tracker
   if obj.isNil: return
-  var node: HyalosInfo = cast[HyalosInfo](cast[uint64](obj) + sizeof T)
+  var node: HyalosInfo = getInfo obj
+
   if not tracker.batches[tid].first:
+    # If the batch is empty, set the last node to the current node and update its reference count
     tracker.batches[tid].last = node
-    node.refs.store(WFR_PROTECT1, moRelaxed)
+    store( node.refs, WFR_PROTECT1, moRelaxed )
+
   else:
     if (tracker.batches[tid].last.birthEpoch > node.birthEpoch):
+      # Update the birth epoch of the last node if the current node has a smaller birth epoch
       tracker.batches[tid].last.birthEpoch = node.birthEpoch
-    node.batchLink.store(tracker.batches[tid].last, moSeqCst)
+    store( node.batchLink, tracker.batches[tid].last, moSeqCst )
     node.batchNext = tracker.batches[tid].first
 
   tracker.batches[tid].first = node
   inc tracker.batches[tid].counter
+
   if tracker.collect and (tracker.batches[tid].counter mod tracker.freq == 0):
-    tracker.batches[tid].last.batchLink.store(rNode(node), moSeqCst)
+    # If the collect flag is set and the counter reaches the collection threshold, retire the batch
+    store( tracker.batches[tid].last.batchLink, rNode(node), moSeqCst )
     tracker.tryRetire(addr tracker.batches[tid])
 
-proc collecting[T, N](tracker: HyalosTracker[T, N]): bool = tracker.collect
+proc collecting*[T, N](tracker: HyalosTracker[T, N]): bool = tracker.collect
 
 
-proc reserveSlot[T, N](tracker: HyalosTracker[T, N]; obj: ptr T; index, tid: int; node: ptr T) =
+proc reserveSlot*[T, N](tracker: HyalosTracker[T, N]; obj: ptr T; index, tid: int; node: ptr T) =
   var prevEpoch: uint64
   var attempts: int
 
-  prevEpoch = tracker.slots[tid].epoch[index].pair[0].load(moAcquire)
+  # Load the previous epoch from the slot
+  prevEpoch = load( tracker.slots[tid].epoch[index].pair[0], moAcquire )
   attempts = 16
   doWhile(attempts != 0):
-    # var objPtr: ptr T
-    # objPtr = obj.load(moAcquire)
-
     var currEpoch: uint64
     currEpoch = getEpoch(tracker)
+    # Check if the current epoch matches the previous epoch
     if currEpoch == prevEpoch:
-      # return objPtr
       return
     else:
+      # Update the epoch and get the new current epoch
       prevEpoch = tracker.doUpdate(currEpoch, index, tid)
-
     dec attempts
 
-  # return tracker.slowPath(obj, index, tid, node)
-  return tracker.slowPath(cast[ptr Nuclear[ptr T]](nil), index, tid, node)
+  # Call the slowPath function to handle the slow path case
+  tracker.slowPath(cast[ptr Nuclear[ptr T]](nil), index, tid, node)
 
 
 proc read*[T,N](tracker: HyalosTracker[T,N]; obj: ptr Nuclear[ptr T]; index, tid: int; node: ptr T): ptr T =
   var prevEpoch: uint64
   var attempts: int
 
-  prevEpoch = tracker.slots[tid].epoch[index].pair[0].load(moAcquire)
+  # Store the current epoch value of the specified index and thread ID
+  prevEpoch = load( tracker.slots[tid].epoch[index].pair[0], moAcquire )
+
+  # max number of attempts
   attempts = 16
+
+  # Loop until the maximum number of attempts is reached
   doWhile(attempts != 0):
     var objPtr: ptr T
     var currEpoch: uint64
 
-    objPtr = obj.load(moAcquire)
+    # Load the object pointer from the specified memory location
+    objPtr = load( obj, moAcquire )
+
+    # Get the current epoch value from the tracker
     currEpoch = getEpoch(tracker)
+
+    # Check if the current epoch matches the previously stored epoch
     if currEpoch == prevEpoch:
+      # return object pointer if epochs match
       return objPtr
     else:
+      # If the epochs don't match, update the previous epoch value using the tracker's doUpdate method
       prevEpoch = tracker.doUpdate(currEpoch, index, tid)
+
     dec attempts
+
+  # If max attempts is reached, enter slowpath
   return tracker.slowPath(obj, index, tid, node)
-
-
 
 proc doUpdate[T, N](tracker: HyalosTracker[T, N]; currEpoch: var uint64; index, tid: int): uint64 =
   template truthy: untyped =
-    not isNil load(tracker.slots[tid].first[index].list[0], moAcquire)
+    not isNil load( tracker.slots[tid].first[index].list[0], moAcquire )
   if truthy:
-    let first = tracker.slots[tid].first[index].list[0].exchange(invPtr[uint64](), moAcqRel)
-    if first != invPtr[ptr HyalosInfo]():
+    let first = exchange( tracker.slots[tid].first[index].list[0], INVPTR, moAcqRel )
+    if first !=! INVPTR:
       ## Traverse cache
-    tracker.slots[tid].first[index].list[0].store(0'u, moSeqCst)
+    store( tracker.slots[tid].first[index].list[0], 0'u, moSeqCst )
     currEpoch = tracker.getEpoch()
-  tracker.slots[tid].epoch[index].pair[0].store(currEpoch, moSeqCst)
+  store( tracker.slots[tid].epoch[index].pair[0], currEpoch, moSeqCst )
   return currEpoch
+
 
 proc helpThread*[T, N](tracker: HyalosTracker[T,N]; tid, index, mytid: int) {.inline.} =
   ## The help_thread function is designed to assist a thread in completing its operation
   ## by updating shared state and ensuring consistency.
   var lastResult: UnionValuePair = cast[UnionValuePair](
-    load(tracker.slots[tid].state[index].hyResult.full, moAcquire)
+    load( tracker.slots[tid].state[index].hyResult.full, moAcquire )
     ) # Load last result for given state structure for given tid and index
 
-  if lastResult.pair[0] != invPtr[uint64]():
+  if lastResult.pair[0] != INVPTR:
     # if first part of lastResult is not an invalid ptr, return immediately
     return
 
-  var birthEpoch = load( tracker.slots[tid].state[index].hyEpoch, moAcquire )
-  var parent: HyalosInfo = load( tracker.slots[tid].state[index].hyParent, moAcquire )
+  var
+    birthEpoch          = load( tracker.slots[tid].state[index].hyEpoch, moAcquire )
+    parent: HyalosInfo  = load( tracker.slots[tid].state[index].hyParent, moAcquire )
+
   if not isNil parent:
-    tracker.slots[mytid].first[tracker.hrNum].list[0].store(nil, moSeqCst)
-    tracker.slots[mytid].epoch[tracker.hrNum].pair[0].store(birthEpoch, moSeqCst)
-  tracker.slots[mytid].state[tracker.hrNum].hyParent.store(parent, moSeqCst)
-  var obj: ptr Nuclear[pointer] = cast[ptr Nuclear[pointer]](
-    tracker.slots[tid].state[index].hyPointer.load(moAcquire)
-  )
-  var seqno: uint64 = tracker.slots[tid].epoch[index].pair[1].load(moAcquire)
+    store( tracker.slots[mytid].first[tracker.hrNum].list[0], nil, moSeqCst )
+    store( tracker.slots[mytid].epoch[tracker.hrNum].pair[0], birthEpoch, moSeqCst )
+  store( tracker.slots[mytid].state[tracker.hrNum].hyParent, parent, moSeqCst )
+
+  var
+    obj: ptr Nuclear[ptr T] = cast[ptr Nuclear[ptr T]](
+      load( tracker.slots[tid].state[index].hyPointer, moAcquire )
+    )
+    seqno: uint64 = load( tracker.slots[tid].epoch[index].pair[1], moAcquire )
+
   if lastResult.pair[1] == seqno:
     var prevEpoch: uint64 = tracker.getEpoch()
 
     template truthy: untyped =
-      lastResult.full[] == load(tracker.slots[tid].state[index].hyResult.full, moAcquire)
+      lastResult.full == load( tracker.slots[tid].state[index].hyResult.full, moAcquire )
+
     block done:
       doWhile(truthy):
         prevEpoch = tracker.doUpdate(prevEpoch, tracker.hrNum +% 1, mytid)
-        var objPtr: ptr T = if not isNil obj: obj.load(moAcquire) else: nil
-        var currEpoch = getEpoch tracker
+
+        var
+          objPtr: ptr T = if not isNil obj: load( obj, moAcquire ) else: nil
+          currEpoch     = getEpoch tracker
+
         if currEpoch == prevEpoch:
           var value: UnionValuePair
           value.pair[0] = cast[uint64](objPtr)
           value.pair[1] = currEpoch
+
           # DCAS
-          if compareExchange(tracker.slots[tid].state[index].hyResult.full, lastResult.full, value.full, moAcqRel, moAcquire):
+          if compareExchange(
+              tracker.slots[tid].state[index].hyResult.full,
+              lastResult.full,
+              value.full,
+              moAcqRel,
+              moAcquire
+              ):
             # An empty epoch transition
             var expseqno: uint64 = seqno
-            discard tracker.slots[tid].epoch[index].pair[1].compareExchange(expseqno, seqno + 1'u, moAcqRel, moRelaxed)
+            discard compareExchange(
+              tracker.slots[tid].epoch[index].pair[1],
+              expseqno,
+              seqno + 1'u,
+              moAcqRel,
+              moRelaxed
+            )
             # clean up the list
+            var old: UnionValuePair
             value.list[0] = nil
             value.pair[1] = seqno + 1'u
-            var old: UnionValuePair
-            old.pair[1] = tracker.slots[tid].first[index].pair[1].load(moAcquire)
-            old.list[0] = tracker.slots[tid].first[index].list[0].load(moAcquire)
+            old.pair[1]   = load( tracker.slots[tid].first[index].pair[1], moAcquire )
+            old.list[0]   = load( tracker.slots[tid].first[index].list[0], moAcquire )
             while old.pair[1] == seqno:
               # DCAS
-              if compareExchangeWeak(tracker.slots[tid].first[index].full, old.full, value.full, moAcqRel, moAcquire):
+              if compareExchangeWeak(
+                tracker.slots[tid].first[index].full,
+                old.full,
+                value.full,
+                moAcqRel,
+                moAcquire
+                ):
                 # clean up the list
-                if old.list[0] != invPtr[HyalosInfo]():
-                  tracker.traverseCache(addr tracker.batches[mytid], old.list[0])
+                if old.list[0] !=! INVPTR:
+                  tracker.traverseCache(mut tracker.batches[mytid], old.list[0])
                 break
             inc seqno
             # set the real epoch
             value.pair[0] = currEpoch
             value.pair[1] = seqno + 1
-            old.pair[1] = tracker.slots[tid].epoch[index].pair[1].load(moAcquire)
-            old.pair[0] = tracker.slots[tid].epoch[index].pair[0].load(moAcquire)
+            old.pair[1]   = load( tracker.slots[tid].epoch[index].pair[1], moAcquire )
+            old.pair[0]   = load( tracker.slots[tid].epoch[index].pair[0], moAcquire )
             while old.pair[1] == seqno:
               # DCAS - 2 iterations at most
-              if compareExchangeWeak( tracker.slots[tid].epoch[index].full, old.full, value.full, moAcqRel, moAcquire):
-                break
+              if compareExchangeWeak(
+                tracker.slots[tid].epoch[index].full,
+                old.full,
+                value.full,
+                moAcqRel,
+                moAcquire
+                ): break
             # check if the node is already retired
-            var ptrVal: uint64 = cast[uint64](objPtr) and 0xFFFFFFFFFFFFFFFC'u
-            var ptrNode: HyalosInfo = cast[HyalosInfo](ptrVal + sizeof(T).uint)
-            if (ptrVal != 0) and (not isNil ptrNode.batchLink.load(moAcquire)):
+            var ptrVal: ptr T = objPtr &! 0xFFFFFFFFFFFFFFFC'u # ptr bitops
+            var ptrNode: HyalosInfo = getInfo ptrVal
+            if (ptrVal !=! 0) and (not isNil load( ptrNode.batchLink, moAcquire )):
               var refs: HyalosInfo = tracker.getRefsNode(ptrNode)
               discard refs.refs.fetchAdd(1'u, moAcqRel)
               # clean up the list
               value.list[0] = rNode refs
               value.pair[1] = seqno + 1
-              old.pair[1] = tracker.slots[tid].first[index].pair[1].load(moAcquire)
-              old.list[0] = tracker.slots[tid].first[index].list[0].load(moAcquire)
+              old.pair[1]   = load( tracker.slots[tid].first[index].pair[1], moAcquire )
+              old.list[0]   = load( tracker.slots[tid].first[index].list[0], moAcquire )
               while old.pair[1] == seqno: # n iterations at most
                 # DCAS
-                if compareExchangeWeak(tracker.slots[tid].first[index].full, old.full, value.full, moAcqRel, moAcquire):
+                if compareExchangeWeak(
+                  tracker.slots[tid].first[index].full,
+                  old.full,
+                  value.full,
+                  moAcqRel,
+                  moAcquire
+                  ):
                   # clean up the list
-                  if old.list[0] != invPtr[HyalosInfo]():
-                    tracker.traverseCache(addr tracker.batches[mytid], old.list[0])
+                  if old.list[0] !=! INVPTR: # ptr arith
+                    tracker.traverseCache(mut tracker.batches[mytid], old.list[0])
                   break done
               # already inserted
               discard refs.refs.fetchSub(1'u, moAcqRel)
             else:
               # an empty list transition
               var expseqno: uint64 = seqno
-              discard tracker.slots[tid].first[index].pair[1].compareExchangeWeak(expseqno, seqno + 1'u, moAcqRel, moRelaxed)
+              discard compareExchangeWeak(
+                tracker.slots[tid].first[index].pair[1],
+                expseqno,
+                seqno + 1'u,
+                moAcqRel,
+                moRelaxed
+                )
           break
         prevEpoch = currEpoch
-    if tracker.slots[mytid].epoch[tracker.hrNum +% 1].pair[0].exchange(0'u, moSeqCst) != 0:
-      var first: HyalosInfo = tracker.slots[mytid].first[tracker.hrNum +% 1].list[0].exchange(invPtr[uint64](), moAcqRel)
-      tracker.traverseCache(addr tracker.batches[mytid], first)
+
+    if 0 != exchange( tracker.slots[mytid].epoch[tracker.hrNum +% 1].pair[0], 0'u, moSeqCst ):
+      var first: HyalosInfo = exchange( tracker.slots[mytid].first[tracker.hrNum +% 1].list[0], INVPTR, moAcqRel )
+      tracker.traverseCache(mut tracker.batches[mytid], first)
+
   # the helpee provided an extra reference
-  if tracker.slots[mytid].state[tracker.hrNum].hyParent.exchange(nil, moSeqCst) != parent:
+  if parent != exchange( tracker.slots[mytid].state[tracker.hrNum].hyParent, nil, moSeqCst ):
     var refs: HyalosInfo = tracker.getRefsNode(parent)
     if refs.refs.fetchSub(1, moAcqRel) == 1:
-      refs.next = tracker.batches[mytid].list
+      refs.next[] = cast[Nuclear[HyalosInfo]](tracker.batches[mytid].list)
       tracker.batches[mytid].list = refs
-  # the parent reservation reference
-  if tracker.slots[mytid].epoch[tracker.hrNum].pair[0].exchange(0'u, moSeqCst) != 0:
-    var first: HyalosInfo = tracker.slots[mytid].first[tracker.hrNum].list[0].exchange(invPtr[uint64](), moAcqRel)
-    tracker.traverseCache(addr tracker.batches[mytid], first)
-  tracker.freeList(tracker.batches[mytid].list)
-  tracker.batches[mytid].list = nil
-  tracker.batches[mytid].listCount = 0
 
-proc helpRead[T, N](tracker: HyalosTracker[T,N], mytid: int) =
+  # the parent reservation reference
+  if 0 != exchange( tracker.slots[mytid].epoch[tracker.hrNum].pair[0], 0'u, moSeqCst ):
+    var first: HyalosInfo = exchange( tracker.slots[mytid].first[tracker.hrNum].list[0], INVPTR, moAcqRel )
+    tracker.traverseCache(mut tracker.batches[mytid], first)
+
+  tracker.freeList(tracker.batches[mytid].list)
+  tracker.batches[mytid].list       = nil
+  tracker.batches[mytid].listCount  = 0
+
+proc helpRead*[T, N](tracker: HyalosTracker[T,N], mytid: int) =
   ## This procedure helps find threads that need help reading
   ## Arguments:
   ## - `tracker`: The HyalosTracker instance to read data from.
@@ -490,12 +648,12 @@ proc helpRead[T, N](tracker: HyalosTracker[T,N], mytid: int) =
 
   # Template to check if the slowCounter is not zero
   template truthy: untyped =
-    tracker.slowCounter.load(moAcquire) != 0'u64
+    load( tracker.slowCounter, moAcquire ) != 0'u64
 
   # Template to check if the result pointer is invalid
   template checkPtrs(i, j: SomeNumber): untyped =
-    let resultPtr = tracker.slots[i].state[j].hyResult.pair[0].load(moAcquire)
-    if resultPtr == invPtr[uint64]():
+    let resultPtr = load( tracker.slots[i].state[j].hyResult.pair[0], moAcquire )
+    if resultPtr == INVPTR:
       # Help thread with reading
       tracker.helpThread(i, j, mytid)
 
@@ -508,30 +666,30 @@ proc helpRead[T, N](tracker: HyalosTracker[T,N], mytid: int) =
         # Check if the result pointer is invalid
         checkPtrs(i, j)
 
-template allocImpl[T, N](tracker: HyalosTracker[T, N], tid: int, body: untyped) {.dirty.} =
-  tracker.allocCounters[tid] = tracker.allocCounters[tid] +% 1
+template allocImpl[T; N: static int](tracker: HyalosTracker[T, N], tid: int, body: untyped) {.dirty.} =
+  inc tracker.allocCounters[tid]
   if (tracker.allocCounters[tid] mod tracker.epochFreq) == 0:
     # help other threads first
     tracker.helpRead(tid)
     # only after that increment the counter
     discard tracker.epoch.addFetch(1'u64, moAcqRel)
   result = body
-  var info: ptr HyalosInfo = result +% sizeof T
+  var info: HyalosInfo = getInfo result
   info.birthEpoch = tracker.getEpoch()
-  info.batchLink.store(nil, moRelaxed)
+  store( info.batchLink, nil, moRelaxed )
 
-proc alloc*[T,N](tracker: HyalosTracker[T, N], tid: int): pointer =
+proc alloc*[T; N: static int](tracker: HyalosTracker[T, N], tid: int): ptr T =
   allocImpl[T](tracker, tid):
     allocShared(sizeof HyalosInfo + sizeof T)
 
 
-proc allocAligned*[T,N](tracker: HyalosTracker[T, N], tid: int, align: Natural): ptr T =
+proc allocAligned*[T; N: static int](tracker: HyalosTracker[T, N], tid: int, align: Natural): ptr T =
   allocImpl[T](tracker, tid):
-    let base = allocShared(sizeof HyalosInfo + sizeof T + align - 1 + sizeof(uint16))
-    let offset = align - (cast[int](base) and (align - 1))
-    template `+!`(p: pointer, s: SomeInteger): pointer =
-      cast[pointer](cast[int](p) +% int(s))
-    cast[ptr uint16](base +! (offset - sizeof(uint16)))[] = uint16(offset)
+    let
+      allocSize = sizeof HyalosInfo + sizeof T + align - 1 + sizeof uint16
+      base      = allocShared allocSize
+      offset    = align - ( cast[int](base) and (align - 1) )
+    cast[ptr uint16](base +! (offset - sizeof(uint16)))[] = uint16(offset) # ptr arith
     base +! offset # let template read result
 
 
@@ -543,34 +701,31 @@ proc newHyalosTracker*[T; N: static int](hrNum, epochFreq, emptyFreq: int; colle
   ## - emptyFreq: The frequency at which empty records are checked and retired.
   ## - collect: A flag indicating whether retired objects should be collected, defaults to false.
   ## RETURNS: An instance of the HyalosTracker[N] type.
-  result = new HyalosTracker[T, N]
-  result.hrNum = hrNum
+  result          = new HyalosTracker[T, N]
+  result.hrNum    = hrNum
   result.epochFreq = epochFreq
-  result.freq = emptyFreq
-  result.collect = collect
+  result.freq     = emptyFreq
+  result.collect  = collect
 
   # Manual alloc batches and slots aligned to 128 byte boundary as per paper
-  var batches = allocAligned0(sizeof(result.batches), 128)
-  var slots = allocAligned0(sizeof(result.slots), 128)
+  var
+    batches       = allocAligned0(sizeof(result.batches), 128)
+    slots         = allocAligned0(sizeof(result.slots), 128)
+    # Manual alloc counters padded to cacheLineSize as per paper
+    allocCounters = allocShared0(sizeof(result.allocCounters))
 
-  # Manual alloc counters padded to cacheLineSize as per paper
-  var allocCounters = allocShared0(sizeof(result.allocCounters))
-
-  result.batches = cast[typeof result.batches](batches)
-  result.slots = cast[typeof result.slots](slots)
-  result.allocCounters = cast[typeof result.allocCounters](allocCounters)
+  result.batches        = cast[typeof result.batches](batches)
+  result.slots          = cast[typeof result.slots](slots)
+  result.allocCounters  = cast[typeof result.allocCounters](allocCounters)
 
   for i in 0..<N:
     for j in 0..<hrNum+2:
       # Initialize slots
-      result.slots[i].first[j].list[0].store(invPtr[uint64](), moRelease)
-      result.slots[i].first[j].pair[1].store(0'u, moRelease)
-      result.slots[i].epoch[j].pair[0].store(0'u, moRelease)
-      result.slots[i].epoch[j].pair[1].store(0'u, moRelease)
+      store( result.slots[i].first[j].list[0], INVPTR, moRelease )
+      store( result.slots[i].first[j].pair[1], 0'u, moRelease )
+      store( result.slots[i].epoch[j].pair[0], 0'u, moRelease )
+      store( result.slots[i].epoch[j].pair[1], 0'u, moRelease )
 
   # Initialize counters
-  result.slowCounter.store(0, moRelease)
-  result.epoch.store(1, moRelease)
-
-# proc newHyalosTracker*[T; N: static int](emptyFreq: int): HyalosTracker[T, N] =
-#   return newHyalosTracker[T, N](0, emptyFreq = emptyFreq, true)
+  store( result.slowCounter, 0, moRelease )
+  store( result.epoch, 1, moRelease )
